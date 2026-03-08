@@ -5,6 +5,10 @@ import { corsHeaders, isAuthorized, jsonResponse, parseJson, textResponse, unaut
 const D1_IN_QUERY_CHUNK_SIZE = 200;
 const D1_BATCH_CHUNK_SIZE = 50;
 const EMBEDDING_BATCH_SIZE = 32;
+const DEFAULT_RERANK_MODEL = "@cf/baai/bge-reranker-base";
+const DEFAULT_RERANK_TOP_N = 20;
+const MAX_RERANK_TOP_N = 50;
+const DEFAULT_RERANK_MAX_CHARS = 2048;
 
 interface VectorizeMatch {
   id: string;
@@ -32,11 +36,27 @@ interface Env extends EmbeddingEnv {
   DB: D1Database;
   SEGMENTS_INDEX: VectorizeIndex;
   API_TOKEN?: string;
+  RERANK_MODEL?: string;
+  RERANK_DEFAULT_ENABLED?: string;
 }
 
 function toQueryMatches(result: VectorizeQueryResult): VectorizeMatch[] {
   const matches = result.matches ?? result.results ?? [];
   return Array.isArray(matches) ? matches : [];
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
+function readBoolEnv(raw: string | undefined, defaultValue: boolean): boolean {
+  if (!raw) return defaultValue;
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) return defaultValue;
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return defaultValue;
 }
 
 function getRequiredApiToken(env: Env): string | null {
@@ -107,6 +127,105 @@ function parseRowMetadata(row: StoredMemoryRow): unknown {
   }
 }
 
+interface RerankRequestConfig {
+  enabled: boolean;
+  model?: string;
+  topN?: number;
+  maxChars?: number;
+}
+
+interface RerankConfig {
+  enabled: boolean;
+  model: string;
+  topN: number;
+  maxChars: number;
+}
+
+function parseRerankRequestConfig(body: unknown): RerankRequestConfig | null {
+  if (!body || typeof body !== "object") return null;
+
+  const record = body as Record<string, unknown>;
+  const rerank = record.rerank ?? record.reranking;
+  if (rerank === true) return { enabled: true };
+  if (!rerank || typeof rerank !== "object" || Array.isArray(rerank)) return null;
+
+  const rerankRecord = rerank as Record<string, unknown>;
+  const enabledValue = rerankRecord.enabled;
+  const enabled = enabledValue === undefined ? true : Boolean(enabledValue);
+  if (!enabled) return null;
+
+  const model = typeof rerankRecord.model === "string" ? rerankRecord.model : undefined;
+  const topN = typeof rerankRecord.topN === "number"
+    ? rerankRecord.topN
+    : typeof rerankRecord.top_n === "number"
+      ? rerankRecord.top_n
+      : undefined;
+  const maxChars = typeof rerankRecord.maxChars === "number"
+    ? rerankRecord.maxChars
+    : typeof rerankRecord.max_chars === "number"
+      ? rerankRecord.max_chars
+      : undefined;
+
+  return { enabled: true, model, topN, maxChars };
+}
+
+function resolveRerankConfig(env: Env, requestBody: unknown, requestedTopK: number): RerankConfig | null {
+  const defaultEnabled = readBoolEnv(env.RERANK_DEFAULT_ENABLED, false);
+
+  const record = requestBody && typeof requestBody === "object" ? (requestBody as Record<string, unknown>) : null;
+  const hasRerankKey = Boolean(record && ("rerank" in record || "reranking" in record));
+
+  if (!hasRerankKey) {
+    if (!defaultEnabled) return null;
+
+    const model = env.RERANK_MODEL?.trim() || DEFAULT_RERANK_MODEL;
+    const topN = clampInt(DEFAULT_RERANK_TOP_N, requestedTopK, MAX_RERANK_TOP_N);
+    const maxChars = clampInt(DEFAULT_RERANK_MAX_CHARS, 128, 16384);
+    return { enabled: true, model, topN, maxChars };
+  }
+
+  const rerankValue = record?.rerank ?? record?.reranking;
+  if (rerankValue === false) return null;
+
+  const parsed = parseRerankRequestConfig(requestBody);
+  if (!parsed) return null;
+
+  const model = parsed.model?.trim() || env.RERANK_MODEL?.trim() || DEFAULT_RERANK_MODEL;
+  const topN = clampInt(parsed.topN ?? DEFAULT_RERANK_TOP_N, requestedTopK, MAX_RERANK_TOP_N);
+  const maxChars = clampInt(parsed.maxChars ?? DEFAULT_RERANK_MAX_CHARS, 128, 16384);
+
+  return { enabled: true, model, topN, maxChars };
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars);
+}
+
+type RerankResultItem = { id: number; score: number };
+
+function extractRerankResults(output: unknown): RerankResultItem[] {
+  if (!output || typeof output !== "object") return [];
+
+  const record = output as Record<string, unknown>;
+  const response = record.response ?? record.results ?? record.data;
+  if (!Array.isArray(response)) return [];
+
+  const items: RerankResultItem[] = [];
+  for (const value of response) {
+    if (!value || typeof value !== "object") continue;
+    const item = value as Record<string, unknown>;
+    const idValue = item.id ?? item.index;
+    const scoreValue = item.score ?? item.relevance_score ?? item.rerank_score;
+    if (typeof idValue !== "number" || !Number.isFinite(idValue)) continue;
+    if (typeof scoreValue !== "number" || !Number.isFinite(scoreValue)) continue;
+    items.push({ id: Math.trunc(idValue), score: scoreValue });
+  }
+
+  return items;
+}
+
 async function indexItems(env: Env, preparedItems: PreparedIndexItem[]): Promise<Response> {
   const now = Date.now();
   const existingHashes = await d1FetchExistingHashes(env.DB, preparedItems.map((item) => item.id));
@@ -158,9 +277,11 @@ async function indexItems(env: Env, preparedItems: PreparedIndexItem[]): Promise
   });
 }
 
-async function searchItems(env: Env, requestInput: SearchRequestInput): Promise<Response> {
+async function searchItems(env: Env, requestInput: SearchRequestInput, requestBody: unknown): Promise<Response> {
   const requestedTopK = currentMemoryShape.getRequestedTopK(requestInput);
-  const candidateTopK = currentMemoryShape.getCandidateTopK(requestInput);
+  const rerankConfig = resolveRerankConfig(env, requestBody, requestedTopK);
+  const baseCandidateTopK = currentMemoryShape.getCandidateTopK(requestInput);
+  const candidateTopK = rerankConfig ? Math.max(baseCandidateTopK, rerankConfig.topN) : baseCandidateTopK;
   const filter = currentMemoryShape.getFilter(requestInput);
   const [queryVector] = await embedTexts(env, [currentMemoryShape.getQueryText(requestInput)]);
 
@@ -181,7 +302,13 @@ async function searchItems(env: Env, requestInput: SearchRequestInput): Promise<
     }));
 
   const rowsById = await d1FetchByIds(env.DB, matches.map((match) => match.id));
-  const enrichedMatches: Array<Record<string, unknown>> = [];
+  const candidates: Array<{
+    row: StoredMemoryRow;
+    metadata: unknown;
+    vectorScore: number | null;
+  }> = [];
+
+  const desiredCandidateCount = rerankConfig ? rerankConfig.topN : requestedTopK;
 
   for (const match of matches) {
     const row = rowsById.get(match.id);
@@ -190,11 +317,77 @@ async function searchItems(env: Env, requestInput: SearchRequestInput): Promise<
     const metadata = parseRowMetadata(row);
     if (!currentMemoryShape.matchesFilter(row, metadata, filter)) continue;
 
-    enrichedMatches.push(currentMemoryShape.toSearchMatch(row, match.score, metadata));
-    if (enrichedMatches.length >= requestedTopK) break;
+    candidates.push({ row, metadata, vectorScore: match.score });
+    if (candidates.length >= desiredCandidateCount) break;
   }
 
-  return jsonResponse(env, { ok: true, topK: requestedTopK, matches: enrichedMatches });
+  if (!rerankConfig) {
+    const enrichedMatches = candidates
+      .slice(0, requestedTopK)
+      .map(({ row, metadata, vectorScore }) => currentMemoryShape.toSearchMatch(row, vectorScore, metadata));
+    return jsonResponse(env, { ok: true, topK: requestedTopK, matches: enrichedMatches });
+  }
+
+  const query = currentMemoryShape.getQueryText(requestInput);
+  const contexts = candidates.map(({ row }) => ({
+    text: truncateText(typeof row.text === "string" ? row.text : "", rerankConfig.maxChars),
+  }));
+
+  let rerankOutput: unknown;
+  try {
+    rerankOutput = await env.AI.run(rerankConfig.model as keyof AiModels, {
+      query,
+      top_k: candidates.length,
+      contexts,
+    } as any);
+  } catch (error) {
+    throw new Error(`Rerank failed: ${(error as Error).message}`);
+  }
+
+  const scoresByIndex = new Map<number, number>();
+  for (const item of extractRerankResults(rerankOutput)) {
+    if (item.id < 0 || item.id >= candidates.length) continue;
+    scoresByIndex.set(item.id, item.score);
+  }
+
+  const reranked = candidates.map((candidate, index) => ({
+    candidate,
+    index,
+    rerankScore: scoresByIndex.get(index) ?? null,
+  }));
+
+  reranked.sort((a, b) => {
+    const scoreA = a.rerankScore ?? Number.NEGATIVE_INFINITY;
+    const scoreB = b.rerankScore ?? Number.NEGATIVE_INFINITY;
+    if (scoreA !== scoreB) return scoreB - scoreA;
+
+    const vectorA = a.candidate.vectorScore ?? Number.NEGATIVE_INFINITY;
+    const vectorB = b.candidate.vectorScore ?? Number.NEGATIVE_INFINITY;
+    if (vectorA !== vectorB) return vectorB - vectorA;
+
+    return a.index - b.index;
+  });
+
+  const enrichedMatches = reranked.slice(0, requestedTopK).map(({ candidate, rerankScore }) => {
+    const score = rerankScore ?? candidate.vectorScore;
+    const base = currentMemoryShape.toSearchMatch(candidate.row, score, candidate.metadata);
+    return {
+      ...base,
+      vector_score: candidate.vectorScore,
+      rerank_score: rerankScore,
+    };
+  });
+
+  return jsonResponse(env, {
+    ok: true,
+    topK: requestedTopK,
+    matches: enrichedMatches,
+    rerank: {
+      enabled: true,
+      model: rerankConfig.model,
+      topN: candidates.length,
+    },
+  });
 }
 
 export default {
@@ -258,7 +451,7 @@ export default {
       }
 
       try {
-        return await searchItems(env, requestInput);
+        return await searchItems(env, requestInput, body);
       } catch (error) {
         return jsonResponse(env, { error: { message: (error as Error).message } }, { status: 502 });
       }

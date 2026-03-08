@@ -83,6 +83,8 @@ npm run deploy
 
 - `API_TOKEN`（secret，必填）：统一鉴权 token；未配置时服务直接返回 `500`
 - `EMBEDDING_MODEL`（var，可选）：默认 `@cf/baai/bge-m3`
+- `RERANK_MODEL`（var，可选）：默认 `@cf/baai/bge-reranker-base`
+- `RERANK_DEFAULT_ENABLED`（var，可选）：默认 `false`；设为 `true` 可让 `/memory/search` 默认启用 rerank
 - `CORS_ALLOW_ORIGIN`（var，可选）：默认 `*`
 
 ## 数据模型（D1）
@@ -144,6 +146,24 @@ curl -sS -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/jso
   https://<your-worker>/memory/search \
   -d '{"query":"hello","topK":5,"filter":{"session_id":"s1","tape":"t1"}}'
 ```
+
+## Rerank（可选）
+
+`/memory/search` 默认只按 Vectorize 的向量相似度排序。
+
+如果你希望“召回 + 精排”，可以在请求体里打开 `rerank`，让 Worker 额外调用 Workers AI 的 reranker 模型对候选结果重排（会带来额外延迟与成本）：
+
+```bash
+curl -sS -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
+  https://<your-worker>/memory/search \
+  -d '{"query":"hello","topK":5,"filter":{"session_id":"s1","tape":"t1"},"rerank":{"enabled":true,"topN":20}}'
+```
+
+当 rerank 启用时，返回的 match 会额外包含：
+
+- `vector_score`：向量相似度分数
+- `rerank_score`：reranker 分数
+- `score`：最终用于排序的分数（优先使用 `rerank_score`，否则回退到 `vector_score`）
 
 ## 从旧资源迁移（可选）
 
