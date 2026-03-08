@@ -1,4 +1,4 @@
-export type Primitive = string | number | boolean;
+import type { Primitive } from "../env";
 
 export interface IndexItemInput {
   id?: string;
@@ -113,7 +113,7 @@ function matchesPrimitive(actual: unknown, expected: Primitive): boolean {
   return false;
 }
 
-export const currentMemoryShape: MemoryShapeAdapter = {
+export const defaultMemorySchema: MemoryShapeAdapter = {
   normalizeIndexRequest(body: unknown): IndexItemInput[] {
     if (Array.isArray(body)) {
       return body.filter(isIndexItemInput);

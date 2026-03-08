@@ -87,6 +87,23 @@ npm run deploy
 - `RERANK_DEFAULT_ENABLED`（var，可选）：默认 `false`；设为 `true` 可让 `/memory/search` 默认启用 rerank
 - `CORS_ALLOW_ORIGIN`（var，可选）：默认 `*`
 
+## 代码结构（src）
+
+核心思路：按功能分层，避免 `src/index.ts` 变成 God file；其中 memory schema 默认导出名为 `defaultMemorySchema`，你可以替换为自己的 schema 以适配不同的存储字段/过滤逻辑。
+
+```text
+src/
+  index.ts              # entry + auth + router
+  env.ts                # Env typings
+  utils.ts              # shared helpers
+
+  api/                  # HTTP layer (request/response)
+  ai/                   # Workers AI wrappers
+  db/                   # D1 access
+  vector/               # Vectorize access
+  memory/               # schema + index/search orchestration
+```
+
 ## 数据模型（D1）
 
 表名：`memory_segments`（见 `cf-rag/migrations/0001_init.sql`）
@@ -165,13 +182,4 @@ curl -sS -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/jso
 - `rerank_score`：reranker 分数
 - `score`：最终用于排序的分数（优先使用 `rerank_score`，否则回退到 `vector_score`）
 
-## 从旧资源迁移（可选）
 
-如果你已经有旧的 D1 / Vectorize（例如 `whisper-memory` / `whisper-segments`），并且希望把资源名切换为 `cf-text` / `cf-vector`，推荐按“复制一份”的方式迁移，旧资源先别删，方便回滚。
-
-复制 D1（Schema + Data）：
-
-```bash
-npx wrangler d1 export whisper-memory --remote --output /tmp/whisper-memory.sql
-npx wrangler d1 execute cf-text --remote --file /tmp/whisper-memory.sql -y
-```
